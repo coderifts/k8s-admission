@@ -1,0 +1,69 @@
+# Customer-hosted ValidatingAdmissionWebhook. Pin your own keyring and TLS
+# material; this image never fetches keys from CodeRifts.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coderifts-admission
+  namespace: coderifts-system
+  labels:
+    app: coderifts-admission
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: coderifts-admission
+  template:
+    metadata:
+      labels:
+        app: coderifts-admission
+    spec:
+      containers:
+        - name: webhook
+          image: coderifts-k8s-admission:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8443
+              name: https
+          env:
+            - name: KEYRING_PATH
+              value: /etc/coderifts/keyring.json
+            - name: TLS_CERT_FILE
+              value: /etc/coderifts/tls/tls.crt
+            - name: TLS_KEY_FILE
+              value: /etc/coderifts/tls/tls.key
+            - name: EXPECTED_OPERATION
+              value: deploy
+            - name: LISTEN_PORT
+              value: "8443"
+          volumeMounts:
+            - name: keyring
+              mountPath: /etc/coderifts
+              readOnly: true
+            - name: tls
+              mountPath: /etc/coderifts/tls
+              readOnly: true
+          readinessProbe:
+            tcpSocket:
+              port: 8443
+            initialDelaySeconds: 2
+            periodSeconds: 10
+      volumes:
+        - name: keyring
+          secret:
+            secretName: coderifts-admission-keyring
+        - name: tls
+          secret:
+            secretName: coderifts-admission-tls
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: coderifts-admission
+  namespace: coderifts-system
+spec:
+  selector:
+    app: coderifts-admission
+  ports:
+    - port: 443
+      targetPort: 8443
+      name: https

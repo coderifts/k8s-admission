@@ -1,0 +1,23 @@
+{
+  "name": "@coderifts/k8s-admission",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Kubernetes ValidatingAdmissionWebhook that denies Pod/Deployment admission unless a signed CodeRifts receipt verifies offline against a customer-pinned keyring.",
+  "license": "MIT",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "start": "node src/index.js"
+  },
+  "files": [
+    "src",
+    "deploy",
+    "README.md",
+    "DEPLOY.md",
+    "LICENSE",
+    "VENDOR.md"
+  ]
+}

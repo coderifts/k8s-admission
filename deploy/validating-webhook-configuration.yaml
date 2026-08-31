@@ -1,0 +1,36 @@
+# failurePolicy: Fail — if the webhook is down, admission is denied (fail-closed).
+# caBundle: PEM of the CA that signed the webhook TLS cert, base64-encoded.
+# Replace REPLACE_WITH_CA_BUNDLE before apply.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: coderifts-admission
+webhooks:
+  - name: admission.coderifts.com
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    failurePolicy: Fail
+    matchPolicy: Equivalent
+    clientConfig:
+      service:
+        name: coderifts-admission
+        namespace: coderifts-system
+        path: /
+        port: 443
+      caBundle: REPLACE_WITH_CA_BUNDLE
+    rules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+        scope: Namespaced
+      - apiGroups: ["apps"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["deployments"]
+        scope: Namespaced
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: coderifts-system
