@@ -8,6 +8,6 @@ This webhook copies the public verifier. It does not `npm install` a CodeRifts-o
 | `src/arity.js` | `receipt-verifier/arity.js` | same |
 | `src/to-dsse.js` | `receipt-verifier/to-dsse.js` | same |
 
-SHA-256 of those copies at vendor time is in `src/VENDOR.sha256`. Do not edit the copied files in this tree; recopy from receipt-verifier.
+SHA-256 of those copies at vendor time is in `src/VENDOR.sha256`, and `test/vendor-core.test.js` fails if the files drift from it. Do not edit the copied files in this tree; recopy from receipt-verifier.
 
 `src/unwrap.js` is the Contract Gate `unwrapReceiptInput` boundary over that `fromDSSE`. Unpacking is not verification.
