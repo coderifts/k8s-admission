@@ -15,6 +15,7 @@
 
 const { verifyReceipt } = require('./verify');
 const { unwrapReceiptInput } = require('./unwrap');
+const { buildDenyRemedy, denyErrorForReason } = require('./deny-remedy.js');
 
 const ANNOTATION_RECEIPT = 'coderifts.com/receipt';
 const ANNOTATION_ENVELOPE = 'coderifts.com/envelope';
@@ -63,13 +64,33 @@ function parseEnvelope(raw) {
   }
 }
 
+/**
+ * A refusal, plus the next step when this refusal has one.
+ *
+ * ADDITIVE: `allowed`, `reason`, `receiptStatus` and `detail` are byte-identical
+ * to what this returned before the remedy existed, so a controller branching on
+ * them is unaffected. A reason that maps to no error class carries no remedy
+ * rather than a guessed one.
+ */
 function deny(reason, extra = {}) {
-  return {
+  const out = {
     allowed: false,
     reason,
     receiptStatus: extra.receiptStatus ?? null,
     detail: extra.detail ?? null,
   };
+  const error = denyErrorForReason(reason);
+  if (error) {
+    const remedy = buildDenyRemedy({
+      error,
+      // The workload this admission was about — the cluster's own addressing.
+      target: extra.target ?? null,
+      fingerprint: extra.fingerprint ?? null,
+      observed: extra.receiptStatus ? { receipt_status: extra.receiptStatus } : undefined,
+    });
+    if (remedy) out.remedy = remedy;
+  }
+  return out;
 }
 
 function allow(extra = {}) {
@@ -97,7 +118,7 @@ function evaluateAdmission({ object, keyring, expectedOperation = 'deploy', now 
   const ann = annotationsOf(object);
   const rawReceipt = ann[ANNOTATION_RECEIPT];
   if (rawReceipt == null || String(rawReceipt).trim() === '') {
-    return deny(REASON.RECEIPT_MISSING);
+    return deny(REASON.RECEIPT_MISSING, { target: workloadIdentity(object) });
   }
 
   let receiptInput = String(rawReceipt).trim();
@@ -110,20 +131,20 @@ function evaluateAdmission({ object, keyring, expectedOperation = 'deploy', now 
 
   const unwrapped = unwrapReceiptInput(receiptInput);
   if (!unwrapped.ok) {
-    if (unwrapped.reason === 'missing_receipt') return deny(REASON.RECEIPT_MISSING);
+    if (unwrapped.reason === 'missing_receipt') return deny(REASON.RECEIPT_MISSING, { target: workloadIdentity(object) });
     if (String(unwrapped.reason).startsWith('dsse_')) {
-      return deny(REASON.DSSE_MALFORMED, { detail: unwrapped.detail || unwrapped.reason });
+      return deny(REASON.DSSE_MALFORMED, { detail: unwrapped.detail || unwrapped.reason, target: workloadIdentity(object) });
     }
-    return deny(REASON.RECEIPT_INVALID, { detail: unwrapped.reason });
+    return deny(REASON.RECEIPT_INVALID, { detail: unwrapped.reason, target: workloadIdentity(object) });
   }
   const token = unwrapped.token;
   if (typeof token !== 'string' || token.length === 0) {
-    return deny(REASON.RECEIPT_MISSING);
+    return deny(REASON.RECEIPT_MISSING, { target: workloadIdentity(object) });
   }
 
   const envelope = parseEnvelope(ann[ANNOTATION_ENVELOPE]);
   if (!envelope) {
-    return deny(REASON.RECEIPT_INVALID, { detail: 'missing decision_result envelope annotation' });
+    return deny(REASON.RECEIPT_INVALID, { detail: 'missing decision_result envelope annotation', target: workloadIdentity(object) });
   }
 
   let result;
@@ -131,16 +152,18 @@ function evaluateAdmission({ object, keyring, expectedOperation = 'deploy', now 
     result = verifyReceipt(token, { ctx: { keyring, expectedKid: null }, envelope, now });
   } catch (err) {
     return deny(REASON.RECEIPT_INVALID, {
+      target: workloadIdentity(object),
       detail: `verify_threw:${err && err.message ? err.message : 'unknown'}`,
     });
   }
   if (!result || result.valid !== true) {
-    return deny(REASON.RECEIPT_INVALID, { receiptStatus: result ? result.status : null });
+    return deny(REASON.RECEIPT_INVALID, { receiptStatus: result ? result.status : null, target: workloadIdentity(object) });
   }
 
   const executionAction = boundSlot(envelope.execution_action);
   if (!executionAction || !PASSING_ACTIONS.has(executionAction)) {
     return deny(REASON.RECEIPT_INVALID, {
+      target: workloadIdentity(object),
       receiptStatus: result.status,
       detail: `execution_action ${executionAction || 'missing'} is not CONTINUE/CONTINUE_WITH_MONITORING`,
     });
@@ -153,18 +176,21 @@ function evaluateAdmission({ object, keyring, expectedOperation = 'deploy', now 
   const mode = boundSlot(envelope.preflight_mode);
   if (mode !== 'authorize') {
     return deny(REASON.SCOPE_MISMATCH, {
+      target: workloadIdentity(object),
       receiptStatus: result.status,
       detail: `preflight_mode ${mode || 'missing'} is not authorize`,
     });
   }
   if (gotOp == null || gotOp !== wantOp) {
     return deny(REASON.SCOPE_MISMATCH, {
+      target: workloadIdentity(object),
       receiptStatus: result.status,
       detail: `operation ${gotOp || 'missing'} does not match ${wantOp}`,
     });
   }
   if (wantTarget == null || gotTarget == null || gotTarget !== wantTarget) {
     return deny(REASON.SCOPE_MISMATCH, {
+      target: workloadIdentity(object),
       receiptStatus: result.status,
       detail: `target_id ${gotTarget || 'missing'} does not match ${wantTarget || 'unbound-object'}`,
     });

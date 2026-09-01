@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://coderifts.com/schemas/deny-remedy.v1.json",
+  "title": "deny-remedy.v1",
+  "description": "A machine-readable remedy attached to a CodeRifts deny. DRAFT — not wired into any surface. Today every deny surface names a reason but none names the next step; this is the shape that would carry it. The tool name in action_required is the only one an agent can call: measured 2026-09-01 from the public MCP tools/list, which serves exactly preflight_change_set, verify_receipt and get_decision_details.",
+  "type": "object",
+  "required": ["error", "action_required", "does_not_promise"],
+  "additionalProperties": false,
+  "properties": {
+    "error": {
+      "description": "Which of the three refusal classes this is. Closed set: a surface that cannot place its refusal in one of these should not emit a remedy at all rather than invent a fourth.",
+      "enum": [
+        "CODERIFTS_GRANT_REQUIRED",
+        "CODERIFTS_GRANT_INVALID",
+        "CODERIFTS_GRANT_MISMATCH"
+      ]
+    },
+    "target": {
+      "description": "What the deny was about, in the surface's own addressing (a repository ref, a resource path, a workload identity, a tool name). Absent when the surface genuinely cannot name it; an absent target must never be rendered as a wildcard.",
+      "type": ["string", "null"]
+    },
+    "fingerprint": {
+      "description": "The change-set fingerprint the deny was evaluated against, when the surface knows it. Absent on CODERIFTS_GRANT_REQUIRED, where no evidence was presented and there is nothing to fingerprint. Present here it lets the caller confirm the re-authorize covers the same bytes.",
+      "type": ["string", "null"],
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "action_required": {
+      "description": "The call that would produce acceptable evidence. One step, not a workflow.",
+      "type": "object",
+      "required": ["tool", "mode", "args_shape"],
+      "additionalProperties": false,
+      "properties": {
+        "tool": {
+          "description": "MEASURED from the live MCP surface. preflight_change_set is the only tool that mints a receipt; verify_receipt and get_decision_details read existing evidence and cannot remedy a deny.",
+          "const": "preflight_change_set"
+        },
+        "mode": {
+          "description": "authorize, always. analyze is informational and mints no receipt, so it cannot clear any of the three refusals.",
+          "const": "authorize"
+        },
+        "args_shape": {
+          "description": "The argument SHAPE, not filled arguments. A deny surface knows what it refused, not the artifact bytes the caller would submit — emitting a ready-to-send payload would mean inventing content.",
+          "type": "object",
+          "required": ["artifacts", "context"],
+          "additionalProperties": false,
+          "properties": {
+            "artifacts": {
+              "type": "string",
+              "const": "Array<{ id, type, before, after }> — the change set being authorized"
+            },
+            "context": {
+              "type": "string",
+              "const": "{ operation, environment?, repository?, branch?, pull_request? } — operation is required for authorize"
+            }
+          }
+        }
+      }
+    },
+    "does_not_promise": {
+      "description": "Carried verbatim so it cannot be dropped in rendering. A remedy that reads as a guarantee is worse than no remedy: it invites a caller to treat obtaining a grant as having executed.",
+      "const": "a grant does not guarantee execution (CAS may still fail)"
+    },
+    "observed": {
+      "description": "What the surface actually saw, for an operator reading a log. Free-form and additive; never a substitute for `error`.",
+      "type": "object",
+      "additionalProperties": true
+    }
+  }
+}

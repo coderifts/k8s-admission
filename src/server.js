@@ -16,6 +16,29 @@ const { loadKeyring } = require('./verify');
 
 const MAX_BODY = 2 * 1024 * 1024;
 
+/**
+ * The refusal Status, plus the next step when the decision carries one.
+ *
+ * `code` and `message` are byte-identical to what this emitted before the
+ * remedy existed — kubectl prints `message`, and changing it would change what
+ * an operator sees at the moment of refusal.
+ *
+ * The remedy rides in `details.causes[]`, which is the structured half of a
+ * Kubernetes Status. `message` there is a STRING by the API contract, so the
+ * remedy is serialised rather than nested: a non-string would not survive
+ * kube-apiserver's decoding.
+ */
+function denyStatus(decision) {
+  const message = decision.reason + (decision.detail ? `: ${decision.detail}` : '');
+  const status = { code: 403, message };
+  if (decision.remedy) {
+    status.details = {
+      causes: [{ reason: 'CodeRiftsDenyRemedy', message: JSON.stringify(decision.remedy) }],
+    };
+  }
+  return status;
+}
+
 function admissionResponse(uid, decision) {
   const allowed = decision.allowed === true;
   return {
@@ -26,7 +49,7 @@ function admissionResponse(uid, decision) {
       allowed,
       status: allowed
         ? { code: 200, message: decision.reason }
-        : { code: 403, message: decision.reason + (decision.detail ? `: ${decision.detail}` : '') },
+        : denyStatus(decision),
     },
   };
 }
