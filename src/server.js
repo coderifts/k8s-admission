@@ -31,11 +31,18 @@ const MAX_BODY = 2 * 1024 * 1024;
 function denyStatus(decision) {
   const message = decision.reason + (decision.detail ? `: ${decision.detail}` : '');
   const status = { code: 403, message };
+  const causes = [];
   if (decision.remedy) {
-    status.details = {
-      causes: [{ reason: 'CodeRiftsDenyRemedy', message: JSON.stringify(decision.remedy) }],
-    };
+    causes.push({ reason: 'CodeRiftsDenyRemedy', message: JSON.stringify(decision.remedy) });
   }
+  // I-1288f — the DECISION's own remediation, beside this gate's. Serialised for the
+  // same reason the remedy is: `causes[].message` is a STRING by the Kubernetes API
+  // contract, and a nested object would not survive kube-apiserver's decoding.
+  // Present only when admit.js read it off an envelope it had already verified.
+  if (decision.nextStep) {
+    causes.push({ reason: 'CodeRiftsNextStep', message: JSON.stringify(decision.nextStep) });
+  }
+  if (causes.length > 0) status.details = { causes };
   return status;
 }
 

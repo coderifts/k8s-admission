@@ -65,6 +65,27 @@ function parseEnvelope(raw) {
 }
 
 /**
+ * The decision's own remediation SUGGESTION, read from an envelope this process
+ * has ALREADY VERIFIED (I-1288f).
+ *
+ * The step lives inside decision_result, so decision_body_hash covers it and the
+ * receipt signs it: reading it here needs no second call to the issuer. That is
+ * the whole reason it is safe to render, and it is also the reason this function
+ * must never be called before verifyReceipt returned valid — an unsigned step is
+ * an attacker-supplied instruction wearing the issuer's voice.
+ *
+ * Shape and closed action set: coderifts-app schemas/decision-result.v1.producer.json
+ * properties.next_agent_step. A step without an action is not a step (same rule as
+ * contract-gate readNextAgentStep).
+ */
+function readNextAgentStep(envelope) {
+  const step = envelope && typeof envelope === 'object' ? envelope.next_agent_step : null;
+  if (!step || typeof step !== 'object' || Array.isArray(step)) return null;
+  if (typeof step.action !== 'string' || step.action.length === 0) return null;
+  return step;
+}
+
+/**
  * A refusal, plus the next step when this refusal has one.
  *
  * ADDITIVE: `allowed`, `reason`, `receiptStatus` and `detail` are byte-identical
@@ -90,6 +111,13 @@ function deny(reason, extra = {}) {
     });
     if (remedy) out.remedy = remedy;
   }
+  // TWO DIFFERENT NEXT STEPS, and they can co-occur. `remedy` is THIS GATE's refusal
+  // class (the grant is missing / invalid / scoped elsewhere). `nextStep` is the
+  // DECISION's, signed by the issuer. Only callers that already hold a verified
+  // envelope pass `verifiedEnvelope`; every pre-verification refusal passes nothing,
+  // so an unverified envelope can never reach this field.
+  const nextStep = readNextAgentStep(extra.verifiedEnvelope);
+  if (nextStep) out.nextStep = nextStep;
   return out;
 }
 
@@ -165,6 +193,7 @@ function evaluateAdmission({ object, keyring, expectedOperation = 'deploy', now 
     return deny(REASON.RECEIPT_INVALID, {
       target: workloadIdentity(object),
       receiptStatus: result.status,
+      verifiedEnvelope: envelope,
       detail: `execution_action ${executionAction || 'missing'} is not CONTINUE/CONTINUE_WITH_MONITORING`,
     });
   }
@@ -178,6 +207,7 @@ function evaluateAdmission({ object, keyring, expectedOperation = 'deploy', now 
     return deny(REASON.SCOPE_MISMATCH, {
       target: workloadIdentity(object),
       receiptStatus: result.status,
+      verifiedEnvelope: envelope,
       detail: `preflight_mode ${mode || 'missing'} is not authorize`,
     });
   }
@@ -185,6 +215,7 @@ function evaluateAdmission({ object, keyring, expectedOperation = 'deploy', now 
     return deny(REASON.SCOPE_MISMATCH, {
       target: workloadIdentity(object),
       receiptStatus: result.status,
+      verifiedEnvelope: envelope,
       detail: `operation ${gotOp || 'missing'} does not match ${wantOp}`,
     });
   }
@@ -192,6 +223,7 @@ function evaluateAdmission({ object, keyring, expectedOperation = 'deploy', now 
     return deny(REASON.SCOPE_MISMATCH, {
       target: workloadIdentity(object),
       receiptStatus: result.status,
+      verifiedEnvelope: envelope,
       detail: `target_id ${gotTarget || 'missing'} does not match ${wantTarget || 'unbound-object'}`,
     });
   }
@@ -201,6 +233,7 @@ function evaluateAdmission({ object, keyring, expectedOperation = 'deploy', now 
 
 module.exports = {
   evaluateAdmission,
+  readNextAgentStep,
   workloadIdentity,
   ANNOTATION_RECEIPT,
   ANNOTATION_ENVELOPE,

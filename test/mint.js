@@ -62,6 +62,19 @@ function writeKeyringFile(dir, signer, status = 'active') {
   return file;
 }
 
+/**
+ * A next_agent_step exactly as the issuer signs it — shape and closed action set from
+ * coderifts-app schemas/decision-result.v1.producer.json properties.next_agent_step
+ * (required: action, reason, resume_condition, then_call; additionalProperties false).
+ * Exported so every surface's tests mint the same bytes.
+ */
+const NEXT_STEP = Object.freeze({
+  action: 'revert',
+  reason: 'remediate_or_revert',
+  resume_condition: 'the removed field is restored or the consumers are migrated',
+  then_call: 'preflight_change_set',
+});
+
 function envelope({ execution_action = 'CONTINUE', decision = 'ALLOW', extra = {} } = {}) {
   return {
     spec_version: 'decision-result.v1.1',
@@ -78,4 +91,4 @@ function envelope({ execution_action = 'CONTINUE', decision = 'ALLOW', extra = {
   };
 }
 
-module.exports = { newSigner, mintV4, tamperSignature, writeKeyringFile, envelope, bodyHash };
+module.exports = { newSigner, mintV4, tamperSignature, writeKeyringFile, envelope, bodyHash, NEXT_STEP };
