@@ -1,15 +1,30 @@
-#!/usr/bin/env node
 'use strict';
 
 /*
- * CodeRifts chain-receipt verifier -- Node >= 20, zero dependencies (node:crypto only).
+ * CodeRifts chain-receipt verifier — PURE LIBRARY. Node >= 20, zero dependencies (node:crypto only).
  *
  * Verify the receipt yourself — offline, no live CodeRifts API call needed.
  * The reference format is frozen in ./RECEIPT_FORMAT.md.
  *
- * Usage:
- *   node verify.js <receipt> [--key pub.pem | --keys <url|file>] [--kid <kid>] [--fetch <url>]
- *   node verify.js --chain receipts.txt [--key pub.pem | --keys <url|file>] [--kid <kid>] [--fetch <url>]
+ * THE SPLIT (1282-A'). This file used to be both the library and the command. The command half
+ * carried the parts a library must not have: a shebang, a `require.main` block, argument parsing,
+ * and `fetchKeyInfo` — a network call whose LEGACY single-key branch returns a key document with
+ * no status field, so a receipt signed by a key that was later revoked verified as current. Four
+ * repositories vendor this file as `src/verify.js`; every one of them was carrying that command,
+ * and none of them could ever run it.
+ *
+ * The command now lives in ./cli.js. `node cli.js <receipt> …` is the same CLI it always was.
+ * Library behaviour is BYTE-IDENTICAL: the cross-language corpus and the envelope-step vectors
+ * pass unmodified, which is the proof that this was a move and not a rewrite.
+ *
+ * WHAT STAYED, and why it is not an inconsistency: `loadKeyring` reads a registry from a URL **or
+ * a local file**, and three of the four vendoring repos call it with a FILE path — it is part of
+ * the library surface they depend on. `fetchKeyInfo` has no file branch and no consumer outside
+ * the command, so it left.
+ *
+ * CLI usage now:
+ *   node cli.js <receipt> [--key pub.pem | --keys <url|file>] [--kid <kid>] [--fetch <url>]
+ *   node cli.js --chain receipts.txt [--key pub.pem | --keys <url|file>] [--kid <kid>] [--fetch <url>]
  *
  * Key discovery: with no --key/--keys, keys are fetched from
  *   https://app.coderifts.com/.well-known/coderifts-keys.json  (override with --fetch <url>).
@@ -355,28 +370,6 @@ function pickActiveFromKeyring(keyring) {
 }
 
 /**
- * Fetch a key document. Accepts BOTH shapes:
- *   - registry: { keys: [{ kid, public_key_pem, status, retired_at, ...}] }
- *   - legacy single-key: { kid, public_key_pem }  (/api/v1/attestation/public-key)
- * Registry returns { publicKey, kid, keyring } (keyring carries retired keys).
- * Legacy returns { publicKey, kid } — same as before, so --keys users + grant
- * verifiers that read publicKey/kid stay byte-compatible.
- */
-async function fetchKeyInfo(url) {
-  const res = await fetch(url, { headers: { Accept: 'application/json' } });
-  if (!res.ok) throw new Error(`fetch ${url} -> HTTP ${res.status}`);
-  const info = await res.json();
-  const keyring = keyringFromDocument(info, url);
-  if (keyring) {
-    const picked = pickActiveFromKeyring(keyring);
-    if (!picked) throw new Error(`no usable keys at ${url}`);
-    return { publicKey: picked.entry.publicKey, kid: picked.kid, keyring };
-  }
-  if (!info || !info.public_key_pem) throw new Error(`no public_key_pem at ${url}`);
-  return { publicKey: keyFromPem(info.public_key_pem), kid: info.kid || null };
-}
-
-/**
  * Build a kid -> key map from a CodeRifts key registry
  * ({ keys: [{ kid, public_key_pem, status, valid_from, retired_at }] }). A --keys source may be
  * an http(s) URL or a local file path. Both active and retired keys are loaded.
@@ -394,110 +387,6 @@ async function loadKeyring(source) {
   const keyring = keyringFromDocument(doc, source);
   if (!keyring) throw new Error(`no keys[] in registry ${source}`);
   return keyring;
-}
-
-// ---------------------------------------------------------------------------
-// CLI
-// ---------------------------------------------------------------------------
-
-function parseArgs(argv) {
-  const opts = { receipt: null, chainFile: null, keyFile: null, keysSource: null, kid: null, fetchUrl: null, envelopeFile: null, audience: null, environment: null };
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i];
-    if (a === '--chain') opts.chainFile = argv[++i];
-    else if (a === '--key') opts.keyFile = argv[++i];
-    else if (a === '--keys') opts.keysSource = argv[++i];
-    else if (a === '--kid') opts.kid = argv[++i];
-    else if (a === '--fetch') opts.fetchUrl = argv[++i];
-    else if (a === '--envelope') opts.envelopeFile = argv[++i];
-    else if (a === '--audience') opts.audience = argv[++i];
-    else if (a === '--environment') opts.environment = argv[++i];
-    else if (a === '-h' || a === '--help') opts.help = true;
-    else if (a.startsWith('--')) throw new Error(`unknown flag: ${a}`);
-    else if (opts.receipt === null) opts.receipt = a;
-    else throw new Error(`unexpected argument: ${a}`);
-  }
-  if (opts.keyFile && opts.keysSource) throw new Error('--key and --keys are mutually exclusive');
-  return opts;
-}
-
-const USAGE =
-  'usage: node verify.js <receipt> [--key pub.pem | --keys <url|file>] [--kid <kid>] [--fetch <url>]\n' +
-  '       node verify.js --chain receipts.txt [--key pub.pem | --keys <url|file>] [--kid <kid>] [--fetch <url>]\n';
-
-function fail(msg) {
-  process.stderr.write(`${msg}\n${USAGE}`);
-  process.exit(2);
-}
-
-async function main() {
-  let opts;
-  try {
-    opts = parseArgs(process.argv.slice(2));
-  } catch (e) {
-    return fail(e.message);
-  }
-  if (opts.help) {
-    process.stdout.write(USAGE);
-    process.exit(2);
-  }
-  // Empty string from `$(curl -s … | grep …)` on GitHub 403/rate-limit is a common silent path
-  // when the homepage one-liner is used without HTTP status checks — fail honestly.
-  if (!opts.chainFile && (!opts.receipt || !String(opts.receipt).trim())) {
-    return fail(
-      'no receipt provided — if you fetched via unauthenticated GitHub comments, a 403 rate limit '
-      + 'yields an empty capture; try again in a minute, or paste the receipt token directly',
-    );
-  }
-
-  // Resolve the verification key(s) + expected kid.
-  let ctx;
-  try {
-    if (opts.keysSource) {
-      // Registry mode: resolve each receipt's key by its kid. --kid stays an
-      // optional additional guard (null => accept any kid present in the registry).
-      const keyring = await loadKeyring(opts.keysSource);
-      ctx = { keyring, expectedKid: opts.kid };
-    } else if (opts.keyFile) {
-      const pem = fs.readFileSync(opts.keyFile, 'utf8');
-      ctx = { publicKey: keyFromPem(pem), expectedKid: opts.kid };
-    } else {
-      const info = await fetchKeyInfo(opts.fetchUrl || DEFAULT_FETCH_URL);
-      if (info.keyring) {
-        // Registry shape: resolve each receipt by kid (retired window included).
-        ctx = { keyring: info.keyring, expectedKid: opts.kid };
-      } else {
-        // Legacy single-key body. An explicit --kid overrides the discovered kid.
-        ctx = { publicKey: info.publicKey, expectedKid: opts.kid || info.kid };
-      }
-    }
-  } catch (e) {
-    return fail(`could not load public key: ${e.message}`);
-  }
-
-  // Optional envelope + dormant-check inputs for the taxonomy.
-  let envelope = null;
-  if (opts.envelopeFile) {
-    try {
-      envelope = JSON.parse(fs.readFileSync(opts.envelopeFile, 'utf8'));
-    } catch (e) {
-      return fail(`could not read --envelope: ${e.message}`);
-    }
-  }
-  const verifyOpts = { envelope, expectedAudience: opts.audience, expectedEnvironment: opts.environment };
-
-  let result;
-  if (opts.chainFile) {
-    const raw = fs.readFileSync(opts.chainFile, 'utf8');
-    const tokens = raw.split('\n').map((l) => l.trim()).filter((l) => l.length > 0);
-    if (tokens.length === 0) return fail('chain file is empty');
-    result = verifyChainInner(tokens, ctx, verifyOpts);
-  } else {
-    result = verifyReceiptInner(opts.receipt, ctx, verifyOpts);
-  }
-
-  process.stdout.write(JSON.stringify(result) + '\n');
-  process.exit(result.valid ? 0 : 1);
 }
 
 function verifyReceipt(token, second, third) {
@@ -523,7 +412,9 @@ module.exports = {
   loadKeyring,
   keyFromPem,
   keyringFromDocument,
-  fetchKeyInfo,
+  // Pure keyring helper. Exported for the command (cli.js fetchKeyInfo) after the split —
+  // it takes a keyring and returns the active entry; it performs no I/O.
+  pickActiveFromKeyring,
   sha256hex,
   DEFAULT_FETCH_URL,
   SIGNING_PREFIX,
@@ -533,8 +424,3 @@ module.exports = {
   expiryLeewayMs,
   isExpiredAt,
 };
-
-// CLI entry — runs ONLY when invoked as a script (node verify.js …), never on require().
-if (require.main === module) {
-  main().catch((e) => fail(e.message));
-}
