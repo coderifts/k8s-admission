@@ -120,6 +120,30 @@ function reconstructSignedInput(payload) {
  *   - single key (default): the one loaded key, gated by expectedKid when known.
  * Returns a KeyObject, or null when the kid is not accepted.
  */
+/**
+ * 1306(a) — accept the SERVED registry shape, not only a Map.
+ *
+ * MEASURED black-box 2026-09-02. `https://app.coderifts.com/.well-known/coderifts-keys.json`
+ * serves `{keys:[{kid, public_key_pem, status, ...}]}`. Passing that document straight into
+ * `verifyReceipt(token, {ctx:{keyring}})` threw `TypeError: ctx.keyring.get is not a function` —
+ * the library path rejected the exact bytes this project publishes for it, while the CLI's
+ * `--keys <url>` worked because it converts first.
+ *
+ * The fix is here rather than in a caller: every consumer that fetches the public registry would
+ * otherwise have to know to convert, and the ones that do not find out with a TypeError rather
+ * than a verdict. `expectedKid` is a separate trap on the same path and is NOT papered over —
+ * `{keyring}` with no `expectedKid` still resolves to null by design (see resolveEntry), because
+ * silently defaulting a kid gate is a different and worse behaviour than a clear TypeError.
+ */
+function coerceKeyring(k, source) {
+  if (!k) return k;
+  if (typeof k.get === 'function') return k;                 // already a Map
+  if (Array.isArray(k.keys) || Array.isArray(k)) {
+    return keyringFromDocument(Array.isArray(k) ? { keys: k } : k, source || 'ctx.keyring');
+  }
+  return k;
+}
+
 function resolveEntry(ctx, payload) {
   if (ctx.keyring) {
     const entry = ctx.keyring.get(payload.kid);
@@ -241,7 +265,11 @@ function verifyReceiptInner(token, ctx, opts = {}) {
   }
 
   // 3. kid -- resolve the entry by kid (keyring) or gate the single key by expectedKid.
-  const entry = resolveEntry(ctx, payload);
+  // 1306(a): a served `{keys:[...]}` document is accepted here as well as a Map.
+  const entry = resolveEntry(
+    ctx.keyring ? { ...ctx, keyring: coerceKeyring(ctx.keyring, 'ctx.keyring') } : ctx,
+    payload,
+  );
   if (!entry) {
     return { valid: false, status: 'UNKNOWN_KEY', reason: 'unknown_kid', payload };
   }
