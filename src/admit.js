@@ -17,6 +17,7 @@ const { verifyReceipt } = require('./verify');
 const { unwrapReceiptInput } = require('./unwrap');
 const { buildDenyRemedy, denyErrorForReason } = require('./deny-remedy.js');
 const { evaluateBundle } = require('./bundle-gate.js');
+const { verifyExecutionGrant, receiptDigest } = require('./verify-grant.js');
 
 const ANNOTATION_RECEIPT = 'coderifts.com/receipt';
 const ANNOTATION_ENVELOPE = 'coderifts.com/envelope';
@@ -27,11 +28,30 @@ const ANNOTATION_ENVELOPE = 'coderifts.com/envelope';
  * reference would mean this webhook fetching it, and this webhook never fetches anything.
  */
 const ANNOTATION_BUNDLE = 'coderifts.com/bundle';
+/**
+ * OPTIONAL execution grant on the BASE path (1307).
+ *
+ * MEASURED before this: this webhook verified the RECEIPT and nothing else. A receipt says a
+ * decision was issued; a grant says this executor may perform this operation on this target, once.
+ * The bundle annotation added grant verification, but only for holders who assemble a bundle —
+ * which is a strictly smaller set than the holders who have a grant.
+ *
+ * A grant is a compact token, so it fits an annotation the same way the receipt does. Nothing about
+ * the AdmissionReview shape prevents it; it simply was not read.
+ *
+ * ADDITIVE: absent → every existing admission decision is byte-identical. Present → verified
+ * offline against the same pinned keyring, and BOUND to the receipt in the sibling annotation.
+ * `requireGrant` turns absence into a refusal for operators who want the stronger posture.
+ */
+const ANNOTATION_GRANT = 'coderifts.com/grant';
 
 const PASSING_ACTIONS = new Set(['CONTINUE', 'CONTINUE_WITH_MONITORING']);
 
 const REASON = Object.freeze({
   RECEIPT_MISSING: 'receipt_missing',
+  GRANT_MISSING: 'grant_missing',
+  GRANT_INVALID: 'grant_invalid',
+  GRANT_NOT_BOUND: 'grant_not_bound',
   BUNDLE_MALFORMED: 'bundle_malformed',
   BUNDLE_NOT_PROVEN: 'bundle_not_proven',
   RECEIPT_INVALID: 'receipt_invalid',
@@ -132,6 +152,16 @@ function deny(reason, extra = {}) {
   return out;
 }
 
+/** What the verdict reports about a grant. Null when none was supplied — absent, not failed. */
+function grantView(r) {
+  if (!r) return null;
+  return {
+    status: r.status,
+    jti: (r.payload && (r.payload.jti || r.payload.grant_id)) || null,
+    operation: (r.payload && r.payload.operation) || null,
+  };
+}
+
 function allow(extra = {}) {
   return {
     allowed: true,
@@ -141,6 +171,7 @@ function allow(extra = {}) {
     // 1261: present ONLY when a bundle annotation was supplied and graded, so an admission
     // without one is byte-identical to what it was before this field existed.
     ...(extra.bundle ? { bundle: extra.bundle } : {}),
+    ...(extra.grant ? { grant: extra.grant } : {}),
   };
 }
 
@@ -152,7 +183,10 @@ function allow(extra = {}) {
  * @param {number} [o.now]
  * @returns {{ allowed:boolean, reason:string, receiptStatus:(string|null), detail:(string|null) }}
  */
-function evaluateAdmission({ object, keyring, expectedOperation = 'deploy', now, bundleSlotOpts = null } = {}) {
+function evaluateAdmission({
+  object, keyring, expectedOperation = 'deploy', now, bundleSlotOpts = null,
+  requireGrant = false, grantKeyring = null,
+} = {}) {
   if (!object || typeof object !== 'object') {
     return deny(REASON.RECEIPT_MISSING, { detail: 'no admitted object' });
   }
@@ -242,6 +276,62 @@ function evaluateAdmission({ object, keyring, expectedOperation = 'deploy', now,
     });
   }
 
+  // ── execution grant on the BASE path (1307) ───────────────────────────────────────────────
+  //
+  // Runs AFTER the receipt and scope checks, never instead of them: the grant is additional
+  // authority over the same deploy, not a second way in.
+  const rawGrant = ann[ANNOTATION_GRANT];
+  const hasGrant = rawGrant != null && String(rawGrant).trim() !== '';
+  let grantResult = null;
+  if (hasGrant) {
+    // Same pinned keyring, same offline rule as the receipt — no fetch, ever. A separate
+    // grantKeyring is accepted because a grant may be signed under a different kid than the
+    // decision, exactly as the Contract Gate allows.
+    // MEASURED signature (verify-grant.js:227-233): verifyExecutionGrant(token, ctx, opts) — ctx
+    // carries { keyring, expectedKid }, opts carries { now, intended }. Folding `now` into ctx
+    // produces UNKNOWN_KEY, because the ring never reaches resolveEntry.
+    //
+    // expectedKid null: accept any kid present in the PINNED ring. Rotation is additive; a kid the
+    // ring does not carry is UNKNOWN_KEY, which is fail-closed.
+    grantResult = verifyExecutionGrant(
+      String(rawGrant).trim(),
+      { keyring: grantKeyring || keyring, expectedKid: null },
+      { now },
+    );
+    if (!grantResult || grantResult.valid !== true) {
+      return deny(REASON.GRANT_INVALID, {
+        target: workloadIdentity(object),
+        receiptStatus: result.status,
+        verifiedEnvelope: envelope,
+        detail: `execution grant did not verify: ${(grantResult && grantResult.status) || 'no result'}`
+          + `${grantResult && grantResult.reason ? ` (${grantResult.reason})` : ''}`,
+      });
+    }
+    // THE BINDING. A valid grant for a DIFFERENT receipt is two true documents about two different
+    // things. Without this check an attacker could pair any verified receipt with any verified
+    // grant and the pair would look complete.
+    const boundTo = grantResult.payload
+      && (grantResult.payload.receipt_digest || grantResult.payload.receipt_hash);
+    const thisReceipt = receiptDigest(unwrapped.token);
+    if (!boundTo || boundTo !== thisReceipt) {
+      return deny(REASON.GRANT_NOT_BOUND, {
+        target: workloadIdentity(object),
+        receiptStatus: result.status,
+        verifiedEnvelope: envelope,
+        detail: 'the grant does not bind the receipt on this object — two valid documents about '
+          + 'different things is not one authorization',
+      });
+    }
+  } else if (requireGrant === true) {
+    return deny(REASON.GRANT_MISSING, {
+      target: workloadIdentity(object),
+      receiptStatus: result.status,
+      verifiedEnvelope: envelope,
+      detail: `requireGrant is set and no ${ANNOTATION_GRANT} annotation was supplied. A receipt `
+        + 'records a decision; a grant is the permission to act on it.',
+    });
+  }
+
   // ── crbundle.v1 (1261) ────────────────────────────────────────────────────────────────────
   //
   // LAST, and additive. An object with no bundle annotation never reaches this block, so every
@@ -279,10 +369,10 @@ function evaluateAdmission({ object, keyring, expectedOperation = 'deploy', now,
         bundle: { state: graded.bundleState, classes: graded.classes },
       });
     }
-    return allow({ receiptStatus: result.status, bundle: { state: graded.bundleState, classes: graded.classes, summary: graded.summary } });
+    return allow({ receiptStatus: result.status, grant: grantView(grantResult), bundle: { state: graded.bundleState, classes: graded.classes, summary: graded.summary } });
   }
 
-  return allow({ receiptStatus: result.status });
+  return allow({ receiptStatus: result.status, grant: grantView(grantResult) });
 }
 
 module.exports = {
@@ -291,6 +381,7 @@ module.exports = {
   workloadIdentity,
   ANNOTATION_RECEIPT,
   ANNOTATION_BUNDLE,
+  ANNOTATION_GRANT,
   ANNOTATION_ENVELOPE,
   PASSING_ACTIONS,
   REASON,
