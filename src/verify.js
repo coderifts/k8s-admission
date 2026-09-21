@@ -23,13 +23,13 @@
  * the command, so it left.
  *
  * CLI usage now:
- *   node cli.js <receipt> [--key pub.pem | --keys <url|file>] [--kid <kid>] [--fetch <url>]
- *   node cli.js --chain receipts.txt [--key pub.pem | --keys <url|file>] [--kid <kid>] [--fetch <url>]
+ *   node cli.js <receipt> [--key pub.pem | --keys <url|file>] [--kid <kid>] [--fetch <url>] [--refresh-keys]
+ *   node cli.js --chain receipts.txt [--key pub.pem | --keys <url|file>] [--kid <kid>] [--fetch <url>] [--refresh-keys]
  *
- * Key discovery: with no --key/--keys, keys are fetched from
- *   https://app.coderifts.com/.well-known/coderifts-keys.json  (override with --fetch <url>).
- * The fetch-and-resolve path accepts BOTH the registry array (active + retired)
- * and the legacy single-key body from /api/v1/attestation/public-key.
+ * Key discovery: with no --key/--keys/--fetch/--refresh-keys, the command loads the
+ * vendored snapshot at keys/coderifts-keys.json (offline). Live fetch is opt-in
+ * (--refresh-keys or --fetch <url> / --keys <url>). DEFAULT_FETCH_URL is the well-known
+ * registry used by those opt-in flags. This library never fetches.
  * --keys resolves each receipt's key by kid from a registry
  *   ({ keys: [{ kid, public_key_pem, status, valid_from, retired_at }] }); accepts a URL or file.
  *
@@ -427,9 +427,17 @@ function verifyChain(tokens, second, third) {
   return verifyChainInner(tokens, ctx, opts);
 }
 
-// Reusable API — require('./verify') imports the pure verify logic WITHOUT running the CLI. The
-// GitHub Action + other embedders use these directly (verifyReceipt/verifyChain/deriveStatus/…);
-// the receipt format + taxonomy are frozen in RECEIPT_FORMAT.md.
+// Reusable API — require('./verify') imports the pure verify logic WITHOUT running the CLI; the
+// receipt format + taxonomy are frozen in RECEIPT_FORMAT.md.
+//
+// WHO ACTUALLY CALLS THESE, measured across the public surface on 2026-09-13:
+//   verifyChain    — cli.js:219 (--chain, with a test) and the Python verifier's public API
+//                    (coderifts_verifier/_verify.py verify_chain).
+//   verifyReceipt  — the contract-gate Action.
+// The previous wording said "the GitHub Action + other embedders use these directly" and listed
+// verifyChain first. That is false for the Action: contract-gate calls verifyReceipt and never
+// verifyChain — its copy of this file only carries the definition. Naming the callers instead of
+// a category keeps the claim checkable.
 module.exports = {
   verifyReceipt,
   verifyChain,
