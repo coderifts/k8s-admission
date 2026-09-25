@@ -1,0 +1,33 @@
+name: CI
+
+# The repository had no workflow at all until 2026-09-24. MEASURED before writing this:
+# `npm test` is `node --test test/*.test.js` and the package has ZERO runtime dependencies, so
+# there is nothing to install — `npm ci` would fail for want of a lockfile it does not need.
+#
+# Actions are pinned to a COMMIT SHA, not a tag. A tag is mutable and a supply-chain step that
+# resolves differently tomorrow is not a step anyone reviewed. Each SHA was verified against the
+# upstream API at pin time, with its release tag in the trailing comment.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # package.json declares engines.node >= 20. The floor is tested because that is what the declaration promises.
+        node-version: ["20", "22"]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: ${{ matrix.node-version }}
+      - name: node --test
+        run: npm test
