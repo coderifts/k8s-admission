@@ -235,6 +235,15 @@ function evaluateAdmission({
   if (!result || result.valid !== true) {
     return deny(REASON.RECEIPT_INVALID, { receiptStatus: result ? result.status : null, target: workloadIdentity(object) });
   }
+  // P66 parity (contract-gate 0.11.9 src/receipt-version.js; receipt-verifier cli.js:333): only a v4
+  // receipt binds the envelope annotation (bh) and carries expires_at. Older is not authorization.
+  if (!result.payload || result.payload.v !== 4 || typeof result.payload.bh !== 'string' || !result.payload.bh) {
+    return deny(REASON.RECEIPT_INVALID, {
+      receiptStatus: 'RECEIPT_VERSION_UNSUPPORTED',
+      target: workloadIdentity(object),
+      detail: `receipt version v${result.payload ? result.payload.v : '?'} binds no envelope; only v4 is accepted`,
+    });
+  }
 
   const executionAction = boundSlot(envelope.execution_action);
   if (!executionAction || !PASSING_ACTIONS.has(executionAction)) {
