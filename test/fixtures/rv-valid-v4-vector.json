@@ -1,0 +1,10 @@
+{
+  "source": "receipt-verifier test/vectors.json (valid_v4)",
+  "kid": "test-k1",
+  "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAB+QFPL1Y/NJTE/6xYr3/FchsS99EB54itXrPs9ZJlP8=\n-----END PUBLIC KEY-----\n",
+  "token": "eyJ2Ijo0LCJraWQiOiJ0ZXN0LWsxIiwiZnAiOiJzaGEyNTY6MTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMSIsInByZXYiOiJudWxsIiwiY2FsbGVyIjoiYnVuZGxlIiwidHMiOiIyMDI2LTA3LTE1VDAwOjAwOjAwLjAwMFoiLCJyZWciOiIiLCJpciI6IiIsImV4cGlyZXNfYXQiOiIyMDk5LTAxLTAxVDAwOjAwOjAwLjAwMFoiLCJiaCI6InNoYTI1NjpjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjIn0.BIUPPIvaj3XbTJ5whMj8soj3XpcsWkG9ddpjlaf4ktKi3XnbNlCwVGf8A6G_0LJaPHtYIwRQf6p8W_ilZEBADg",
+  "expected": {
+    "valid": true,
+    "status": "VERIFIED_CURRENT"
+  }
+}

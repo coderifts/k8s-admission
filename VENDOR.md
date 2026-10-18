@@ -4,7 +4,7 @@ This webhook copies the public verifier. It does not `npm install` a CodeRifts-o
 
 | File | Source | Revision |
 |------|--------|----------|
-| `src/verify.js` | `receipt-verifier/verify.js` | `ccc53f9a592aaa7f6072d5c80d724f36de30a8ab` |
+| `src/verify.js` | `receipt-verifier/verify.js` | `fef5018a39be90b2b5e304bf1df5db3b10e0b697` (signed tag v1.1.4) |
 | `src/arity.js` | `receipt-verifier/arity.js` | same |
 | `src/to-dsse.js` | `receipt-verifier/to-dsse.js` | same |
 

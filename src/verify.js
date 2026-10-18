@@ -263,6 +263,14 @@ function verifyReceiptInner(token, ctx, opts = {}) {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
     return { valid: false, status: 'MALFORMED', reason: 'bad_json' };
   }
+  // 1.1.1 (2026-10-12, audit-2 F6): a signed field is a string or absent — checked before the signature, so
+  // both verifiers answer alike. MEASURED: `expires_at: [...]` passed the '|' guard (string-only) and the v4
+  // expiry check (string-only), and an expired receipt verified VERIFIED_CURRENT.
+  for (const k of SIGNED_FIELDS) {
+    if (payload[k] !== undefined && typeof payload[k] !== 'string') {
+      return { valid: false, status: 'MALFORMED', reason: 'non_string_signed_field', field: k, payload };
+    }
+  }
 
   // 3. kid -- resolve the entry by kid (keyring) or gate the single key by expectedKid.
   // 1306(a): a served `{keys:[...]}` document is accepted here as well as a Map.
@@ -417,9 +425,24 @@ async function loadKeyring(source) {
   return keyring;
 }
 
+/**
+ * 1.1.4 (2026-10-18): a receipt used beside an envelope must be v4 — the rule moves here from cli.js
+ * (1.1.1, P66), so every consumer of the core gets it. MEASURED 2026-10-17: two gateways that vendored
+ * this core admitted a production-signed v2 receipt beside a forged ALLOW envelope, because the core
+ * answered valid:true; v1–v3 bind no envelope (no `bh`) and carry no expiry. Any envelope object counts,
+ * `{}` included (the CLI's JS truthiness). A bare token with no envelope stays a signature check, and
+ * verifyChain is unchanged (it checks links, not an envelope per link).
+ */
+function v4EnvelopeRule(result, opts) {
+  const v = result && result.payload && result.payload.v;
+  if (!opts || !opts.envelope || !result || !result.valid || !result.payload || v === 4) return result;
+  return { ...result, valid: false, signature_status: result.status, status: 'RECEIPT_VERSION_UNSUPPORTED',
+    reason: `receipt version v${v} binds no envelope and carries no expiry; only a v4 receipt is accepted with an envelope or --from-commit` };
+}
+
 function verifyReceipt(token, second, third) {
   const { ctx, opts } = split3ary('verifyReceipt', arguments.length, second, third);
-  return verifyReceiptInner(token, ctx, opts);
+  return v4EnvelopeRule(verifyReceiptInner(token, ctx, opts), opts);
 }
 
 function verifyChain(tokens, second, third) {
