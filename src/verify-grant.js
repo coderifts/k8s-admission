@@ -12,15 +12,20 @@
  *        [--intended-after-file PATH | --intended-scope-hash sha256:…]
  *        [--receipt <token>]
  *   node verify-grant.js <grant> --key pub.pem [--kid <kid>]   # offline pin
+ *        [--intended-executor E --intended-adapter A --intended-environment ENV]
+ *        [--as-of <ISO>] [--json]
+ *   coderifts-receipt-verifier grant <grant> …                  # the same command, npm bin
  *
  * Key discovery: --keys resolves by kid from a registry
  *   ({ keys: [{ kid, public_key_pem, status, valid_from, retired_at }] }).
  * --key pins a single SPKI PEM (same as verify.js). --key and --keys are
- * mutually exclusive. With neither, the public key is fetched from
- *   https://app.coderifts.com/api/v1/attestation/public-key  (override --fetch).
+ * mutually exclusive. With neither (1.1.7), the pinned snapshot keys/coderifts-keys.json,
+ * offline; --fetch [url] is the opt-in network path
+ *   (default https://app.coderifts.com/api/v1/attestation/public-key).
  *
- * Output: JSON { valid, status, reason?, payload? } to stdout — byte-identical
- * to verify_grant.py. Exit codes: 0 GRANT_CURRENT, 1 otherwise, 2 usage error.
+ * Output: JSON { valid, status, reason?, payload?, verified_with?, keyring? } to stdout —
+ * byte-identical to verify_grant.py, except --as-of (JS only).
+ * Exit codes: 0 GRANT_CURRENT (with --as-of: valid_at_as_of), 1 otherwise, 2 usage error.
  *
  * Retired kid → UNKNOWN_KEY. Grants are live execution permission; receipts
  * may forensically verify a retired key inside [valid_from, retired_at),
@@ -29,15 +34,17 @@
 
 const crypto = require('node:crypto');
 const fs = require('node:fs');
+const path = require('node:path');
 const {
   loadKeyring,
   keyFromPem,
-  fetchKeyInfo,
   sha256hex,
   canonicalJson,
   CLOCK_SKEW_LEEWAY_MS,
   isExpiredAt,
   expiryLeewayMs,
+  parseAsOf,
+  parseJsonStrict,
 } = require('./verify.js');
 const { split3ary } = require('./arity');
 
@@ -91,8 +98,21 @@ const V2_REQUIRED_STRINGS = Object.freeze([
  * comment is what a reader should be shown if anyone claims otherwise before then.
  */
 const V2_RESERVED_INERT = Object.freeze(['call_hash', 'executor_image_digest', 'applied_policy_hash']);
+/**
+ * 1.1.7 (2026-10-31) — `environment`: an OPTIONAL v2 field that IS checked, unlike the reserved ones.
+ *
+ * MEASURED: the app issuer adds it when the decision names one (coderifts-app
+ * src/verdict-core/execution-grant-v2.js) and this verifier read such a grant as MALFORMED /
+ * unknown_field. It is signed like every v2 field (the preimage is the canonical JSON of the whole
+ * body). Present → a non-empty string, else MALFORMED / bad_environment. Compared only when the
+ * caller states an intended environment (--intended-environment), and then an ABSENT environment is
+ * a mismatch too: a grant that names no environment is not bound to the one the caller is in.
+ */
+const V2_OPTIONAL_SIGNED_STRINGS = Object.freeze(['environment']);
 const TARGET_SCHEMES = Object.freeze(['fs', 'git', 'api', 'db', 'registry', 'deploy']);
 const DEFAULT_FETCH_URL = 'https://app.coderifts.com/api/v1/attestation/public-key';
+/** 1.1.7: the CLI default with no --key / --keys / --fetch — the pinned snapshot cli.js uses for receipts. */
+const VENDORED_KEYS_PATH = path.join(__dirname, 'keys', 'coderifts-keys.json');
 
 function isIssuedInFuture(issuedAtMs, nowMs, context) {
   if (!Number.isFinite(issuedAtMs) || !Number.isFinite(nowMs)) return false;
@@ -187,6 +207,23 @@ function receiptDigest(token) {
   return `sha256:${sha256hex(String(token))}`;
 }
 
+/**
+ * 1.1.7 — a retired key under --as-of. Without as-of a retired kid is always UNKNOWN_KEY (a grant is
+ * live permission). With as-of the question is "was this grant usable at that instant", and a key
+ * still active then could sign one: allowed only when the grant's start AND the as-of instant are both
+ * before retired_at. A retired entry without a parseable retired_at stays refused.
+ */
+function retiredKeyActiveAt(entry, issuedRaw, asOfMs) {
+  const retired = typeof entry.retired_at === 'string' ? Date.parse(entry.retired_at) : NaN;
+  const issued = typeof issuedRaw === 'string' ? Date.parse(issuedRaw) : NaN;
+  return Number.isFinite(retired) && Number.isFinite(issued) && Number.isFinite(asOfMs)
+    && issued < retired && asOfMs < retired;
+}
+
+function hasRevokedAt(entry) {
+  return typeof entry.revoked_at === 'string' && entry.revoked_at.length > 0;
+}
+
 function resolveEntry(ctx, payload) {
   if (ctx.keyring) {
     const entry = ctx.keyring.get(payload.kid);
@@ -212,9 +249,12 @@ function verifyExecutionGrantV2(payload, sigB64, ctx, opts = {}) {
   }
   // The reserved names are ADMITTED, never inspected. Everything below this line treats a payload
   // carrying them identically to one that does not — verified by test, not by intent.
-  const allowed = new Set([...V2_REQUIRED_STRINGS, 'max_attempts', ...V2_RESERVED_INERT]);
+  const allowed = new Set([...V2_REQUIRED_STRINGS, 'max_attempts', ...V2_RESERVED_INERT, ...V2_OPTIONAL_SIGNED_STRINGS]);
   for (const k of Object.keys(payload)) {
     if (!allowed.has(k)) return { valid: false, status: 'MALFORMED', reason: 'unknown_field', payload };
+  }
+  if ('environment' in payload && (typeof payload.environment !== 'string' || payload.environment.length === 0)) {
+    return { valid: false, status: 'MALFORMED', reason: 'bad_environment', payload };
   }
   if (!canonicalizeTargetUri(payload.target_uri)) {
     return { valid: false, status: 'MALFORMED', reason: 'bad_target_uri', payload };
@@ -224,11 +264,18 @@ function verifyExecutionGrantV2(payload, sigB64, ctx, opts = {}) {
   if (!entry) {
     return { valid: false, status: 'UNKNOWN_KEY', reason: 'unknown_kid', payload };
   }
-  if (entry.status === 'retired') {
+  // Addendum 1.1.7: a revoked_at refuses at every instant, whatever `status` says (RECEIPT_FORMAT §7.1),
+  // and before the retired rule — a retired entry that also carries revoked_at is revoked, not retired.
+  if (entry.status === 'revoked' || hasRevokedAt(entry)) {
+    return { valid: false, status: 'UNKNOWN_KEY', reason: 'revoked_kid', payload };
+  }
+  const auditing = Number.isFinite(opts.auditAsOfMs);
+  if (entry.status === 'retired' && !(auditing && retiredKeyActiveAt(entry, payload.not_before, opts.auditAsOfMs))) {
     return { valid: false, status: 'UNKNOWN_KEY', reason: 'retired_kid', payload };
   }
-  if (entry.status === 'revoked') {
-    return { valid: false, status: 'UNKNOWN_KEY', reason: 'revoked_kid', payload };
+  // Addendum 1.1.7: an unknown status fails closed, as v1 always did (it was GRANT_CURRENT here).
+  if (entry.status != null && entry.status !== 'active' && entry.status !== 'retired') {
+    return { valid: false, status: 'UNKNOWN_KEY', reason: 'unknown_key_status', payload };
   }
 
   let ok = false;
@@ -258,24 +305,27 @@ function verifyExecutionGrantV2(payload, sigB64, ctx, opts = {}) {
     return { valid: false, status: 'GRANT_EXPIRED', reason: 'nbf_in_future', payload };
   }
 
-  if (intended.executor_id && payload.executor_id !== String(intended.executor_id)) {
+  // 1.1.8: a stated intended value is checked whether or not it is truthy — "given" is the question, not
+  // "non-empty" (a library caller passing "" gets a mismatch, never a skipped binding). v1 below keeps its
+  // documented reading of "" as not stated.
+  if (intended.executor_id != null && payload.executor_id !== String(intended.executor_id)) {
     return { valid: false, status: 'GRANT_UNBOUND', reason: 'executor_mismatch', payload };
   }
-  if (intended.adapter_id && payload.adapter_id !== String(intended.adapter_id)) {
+  if (intended.adapter_id != null && payload.adapter_id !== String(intended.adapter_id)) {
     return { valid: false, status: 'GRANT_UNBOUND', reason: 'adapter_mismatch', payload };
   }
-  if (intended.target_uri) {
+  if (intended.target_uri != null) {
     const want = canonicalizeTargetUri(String(intended.target_uri)) || String(intended.target_uri);
     if (payload.target_uri !== want) {
       return { valid: false, status: 'GRANT_UNBOUND', reason: 'target_mismatch', payload };
     }
   }
-  if (intended.audience) {
+  if (intended.audience != null) {
     if (payload.audience_hash !== sha256pref(intended.audience)) {
       return { valid: false, status: 'GRANT_UNBOUND', reason: 'audience_mismatch', payload };
     }
   }
-  if (intended.audience_hash && payload.audience_hash !== String(intended.audience_hash)) {
+  if (intended.audience_hash != null && payload.audience_hash !== String(intended.audience_hash)) {
     return { valid: false, status: 'GRANT_UNBOUND', reason: 'audience_mismatch', payload };
   }
   if (intended.after_payload != null) {
@@ -283,10 +333,13 @@ function verifyExecutionGrantV2(payload, sigB64, ctx, opts = {}) {
       return { valid: false, status: 'GRANT_UNBOUND', reason: 'after_payload_mismatch', payload };
     }
   }
-  if (intended.operation && payload.operation !== String(intended.operation)) {
+  if (intended.operation != null && payload.operation !== String(intended.operation)) {
     return { valid: false, status: 'GRANT_UNBOUND', reason: 'operation_mismatch', payload };
   }
-  if (intended.receipt_token) {
+  if (intended.environment != null && payload.environment !== String(intended.environment)) {
+    return { valid: false, status: 'GRANT_UNBOUND', reason: 'environment_mismatch', payload };
+  }
+  if (intended.receipt_token != null) {
     if (sha256pref(intended.receipt_token) !== payload.receipt_hash) {
       return { valid: false, status: 'GRANT_UNBOUND', reason: 'receipt_hash_mismatch', payload };
     }
@@ -302,6 +355,53 @@ function verifyExecutionGrantV2(payload, sigB64, ctx, opts = {}) {
  * @returns {{ valid: boolean, status: string, reason?: string, payload?: object }}
  */
 function verifyExecutionGrantInner(token, ctx, opts = {}) {
+  if (opts && opts.asOf != null) return auditGrant(token, ctx, opts);
+  return verifyGrantAt(token, ctx, opts);
+}
+
+/**
+ * 1.1.7 (2026-10-31) — `asOf` for grants: "was this grant inside its window at a stated instant?".
+ *
+ * The receipt rule of 1.1.6 (verify.js auditResult), with one deliberate difference. The core runs
+ * unchanged with now = asOf: signature, key lookup, every binding check. Key rules: revoked fails at
+ * any instant; a retired key passes only if it was still active at not_before AND at asOf
+ * (retiredKeyActiveAt). Only a verdict the core reached is re-labelled:
+ *   GRANT_CURRENT at asOf            → GRANT_CURRENT_AT_AS_OF, valid_at_as_of true
+ *   GRANT_EXPIRED expired at asOf    → GRANT_EXPIRED, valid_at_as_of false, expired_now
+ *   not yet valid at asOf            → GRANT_NOT_YET_VALID_AT_AS_OF
+ * THE DIFFERENCE: `valid` is false on every audit verdict. A receipt is evidence; a grant is live
+ * permission, and a caller that reads `valid` must never get a yes to "may I execute now" from an
+ * answer about another instant. The audit answer is valid_at_as_of (and the CLI exit code).
+ * asOf later than now + 30s throws (as_of_in_future), as for receipts.
+ */
+const GRANT_AS_OF_DOES_NOT_PROVE = 'that the grant may be used now: as-of evaluates a stated instant, so this is not '
+  + 'permission to execute now (valid stays false); verify without --as-of before executing';
+
+function auditGrant(token, ctx, opts) {
+  const nowMs = Number.isFinite(opts.now) ? opts.now : Date.now();
+  const asOfMs = parseAsOf(opts.asOf, nowMs);
+  const r = verifyGrantAt(token, ctx, { ...opts, now: asOfMs, auditAsOfMs: asOfMs });
+  const p = r.payload && typeof r.payload === 'object' ? r.payload : null;
+  const v2 = p && p.v === GRANT_VERSION_V2;
+  const window = {
+    not_before: p ? ((v2 ? p.not_before : p.iat) ?? null) : null,
+    expires_at: p ? ((v2 ? p.expires_at : p.exp) ?? null) : null,
+  };
+  const expMs = typeof window.expires_at === 'string' ? Date.parse(window.expires_at) : NaN;
+  const intended = opts.intended && typeof opts.intended === 'object' ? opts.intended : {};
+  const base = {
+    ...r, valid: false, mode: 'audit', as_of: new Date(asOfMs).toISOString(), window,
+    expired_now: Number.isFinite(expMs) && isExpiredAt(expMs, nowMs, intended),
+  };
+  const tail = { does_not_prove: [GRANT_AS_OF_DOES_NOT_PROVE] };
+  if (r.status === 'GRANT_CURRENT') return { ...base, status: 'GRANT_CURRENT_AT_AS_OF', valid_at_as_of: true, ...tail };
+  if (r.status === 'GRANT_EXPIRED' && (r.reason === 'nbf_in_future' || r.reason === 'iat_in_future')) {
+    return { ...base, status: 'GRANT_NOT_YET_VALID_AT_AS_OF', reason: 'as_of_before_not_before', valid_at_as_of: false, ...tail };
+  }
+  return { ...base, valid_at_as_of: false, ...tail };
+}
+
+function verifyGrantAt(token, ctx, opts = {}) {
   // 1. structure
   if (typeof token !== 'string' || token.length === 0) {
     return { valid: false, status: 'MALFORMED', reason: 'malformed_structure' };
@@ -313,13 +413,25 @@ function verifyExecutionGrantInner(token, ctx, opts = {}) {
 
   // 2. json + version + signed fields as strings; unknown keys MALFORMED
   let payload;
+  const text = Buffer.from(segments[0], 'base64url').toString('utf8');
   try {
-    payload = JSON.parse(Buffer.from(segments[0], 'base64url').toString('utf8'));
+    payload = JSON.parse(text);
   } catch (_) {
     return { valid: false, status: 'MALFORMED', reason: 'bad_json' };
   }
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
     return { valid: false, status: 'MALFORMED', reason: 'bad_json' };
+  }
+  // Addendum 1.1.7 — the v2 body is also read by parseJsonStrict (RECEIPT_FORMAT §2.2, the receipt rule).
+  // MEASURED before: a duplicate executor_id was read as its LAST value by JSON.parse and graded
+  // GRANT_CURRENT for that reading. A duplicate member, a lone surrogate or a non-finite number is now
+  // MALFORMED with the strict code, and the payload is NOT echoed: the body has no single reading. A
+  // duplicate "v" is refused whichever version JSON.parse picked, since the version claim itself is
+  // ambiguous. Text JSON.parse rejects keeps bad_json above; v1 bodies are otherwise unchanged.
+  let strictErr = null;
+  try { parseJsonStrict(text); } catch (e) { strictErr = e; }
+  if (strictErr && (payload.v === GRANT_VERSION_V2 || strictErr.pointer === '/v')) {
+    return { valid: false, status: 'MALFORMED', reason: strictErr.code || 'invalid_json' };
   }
   if (payload.v === GRANT_VERSION_V2) {
     return verifyExecutionGrantV2(payload, segments[1], ctx, opts);
@@ -359,7 +471,13 @@ function verifyExecutionGrantInner(token, ctx, opts = {}) {
   if (!entry) {
     return { valid: false, status: 'UNKNOWN_KEY', reason: 'unknown_kid', payload };
   }
-  if (entry.status === 'retired') {
+  // Addendum 1.1.7: a revoked_at refuses at every instant, whatever `status` says. A status "revoked" entry
+  // keeps the compromised_at rule below (revoked_kid / revoked_kid_undecidable).
+  if (entry.status !== 'revoked' && hasRevokedAt(entry)) {
+    return { valid: false, status: 'UNKNOWN_KEY', reason: 'revoked_kid', payload };
+  }
+  const auditing = Number.isFinite(opts.auditAsOfMs);
+  if (entry.status === 'retired' && !(auditing && retiredKeyActiveAt(entry, payload.iat, opts.auditAsOfMs))) {
     return { valid: false, status: 'UNKNOWN_KEY', reason: 'retired_kid', payload };
   }
   // KEY STATUS GATE — RECEIPT_FORMAT.md 7.1 (normative).
@@ -392,7 +510,7 @@ function verifyExecutionGrantInner(token, ctx, opts = {}) {
       payload,
     };
   }
-  if (entry.status != null && entry.status !== 'active') {
+  if (entry.status != null && entry.status !== 'active' && !(auditing && entry.status === 'retired')) {
     return { valid: false, status: 'UNKNOWN_KEY', reason: 'unknown_key_status', payload };
   }
 
@@ -457,9 +575,26 @@ function verifyExecutionGrantInner(token, ctx, opts = {}) {
     return { valid: false, status: 'GRANT_SCOPE_MISMATCH', reason: 'scope_hash_mismatch', payload };
   }
 
+  // 1.1.7: v1 has no environment field, so a stated intended environment cannot be met.
+  if (intended.environment) {
+    return { valid: false, status: 'GRANT_UNBOUND', reason: 'environment_mismatch', payload };
+  }
+
   // 10.
   return { valid: true, status: 'GRANT_CURRENT', payload };
 }
+
+/** The --intended-* flags and the option each one sets (1.1.8: shared, so all eight refuse an empty value). */
+const INTENDED_FLAGS = Object.freeze({
+  '--intended-operation': 'intendedOperation',
+  '--intended-target': 'intendedTarget',
+  '--intended-audience': 'intendedAudience',
+  '--intended-executor': 'intendedExecutor',
+  '--intended-adapter': 'intendedAdapter',
+  '--intended-environment': 'intendedEnvironment',
+  '--intended-after-file': 'intendedAfterFile',
+  '--intended-scope-hash': 'intendedScopeHash',
+});
 
 function parseArgs(argv) {
   const opts = {
@@ -467,15 +602,19 @@ function parseArgs(argv) {
     keyFile: null,
     keysSource: null,
     kid: null,
+    fetch: false,
     fetchUrl: null,
     intendedOperation: null,
     intendedTarget: null,
     intendedAudience: null,
     intendedExecutor: null,
     intendedAdapter: null,
+    intendedEnvironment: null,
     intendedAfterFile: null,
     intendedScopeHash: null,
     receipt: null,
+    asOf: undefined,
+    json: false,
     help: false,
   };
   for (let i = 0; i < argv.length; i++) {
@@ -483,67 +622,124 @@ function parseArgs(argv) {
     if (a === '--key') opts.keyFile = argv[++i];
     else if (a === '--keys') opts.keysSource = argv[++i];
     else if (a === '--kid') opts.kid = argv[++i];
-    else if (a === '--fetch') opts.fetchUrl = argv[++i];
-    else if (a === '--intended-operation') opts.intendedOperation = argv[++i];
-    else if (a === '--intended-target') opts.intendedTarget = argv[++i];
-    else if (a === '--intended-audience') opts.intendedAudience = argv[++i];
-    else if (a === '--intended-executor') opts.intendedExecutor = argv[++i];
-    else if (a === '--intended-adapter') opts.intendedAdapter = argv[++i];
-    else if (a === '--intended-after-file') opts.intendedAfterFile = argv[++i];
-    else if (a === '--intended-scope-hash') opts.intendedScopeHash = argv[++i];
+    // 1.1.7: --fetch [url] — the opt-in network path; without a URL, the default endpoint.
+    else if (a === '--fetch') {
+      opts.fetch = true;
+      if (/^https?:\/\//i.test(argv[i + 1] || '')) opts.fetchUrl = argv[++i];
+    }
+    // 1.1.8: an --intended-* flag given with an empty (or no) value is a usage error, exit 2. MEASURED on
+    // 1.1.7: `--intended-executor ""` set the field to "", every check below read it as falsy and skipped
+    // the binding, and the grant answered GRANT_CURRENT, exit 0 — for all eight flags, js and py.
+    else if (Object.prototype.hasOwnProperty.call(INTENDED_FLAGS, a)) {
+      const value = argv[++i];
+      if (value === undefined || value === '') throw new Error(`${a} needs a non-empty value (an empty one would check nothing)`);
+      opts[INTENDED_FLAGS[a]] = value;
+    }
     else if (a === '--receipt') opts.receipt = argv[++i];
+    else if (a === '--as-of') opts.asOf = argv[++i];
+    else if (a === '--json') opts.json = true;
     else if (a === '-h' || a === '--help') opts.help = true;
     else if (a.startsWith('--')) throw new Error(`unknown flag: ${a}`);
     else if (opts.grant === null) opts.grant = a;
     else throw new Error(`unexpected argument: ${a}`);
   }
   if (opts.keyFile && opts.keysSource) throw new Error('--key and --keys are mutually exclusive');
+  if (opts.fetch && (opts.keyFile || opts.keysSource)) throw new Error('--fetch is mutually exclusive with --key and --keys');
   if (opts.intendedAfterFile && opts.intendedScopeHash) {
     throw new Error('--intended-after-file and --intended-scope-hash are mutually exclusive');
   }
+  if (opts.asOf !== undefined) parseAsOf(opts.asOf); // throws as_of_unparsable / as_of_in_future → exit 2
   return opts;
 }
 
-const USAGE =
-  'usage: node verify-grant.js <grant> [--key pub.pem | --keys <url|file>] [--kid <kid>] [--fetch <url>]\n'
-  + '                         [--intended-operation X] [--intended-target Y] [--intended-audience Z]\n'
-  + '                         [--intended-after-file PATH | --intended-scope-hash sha256:…]\n'
-  + '                         [--receipt <token>]\n';
+const usageFor = (prog) => {
+  const pad = ' '.repeat(prog.length + 8);
+  return `usage: ${prog} <grant> [--key pub.pem | --keys <url|file> | --fetch [url]] [--kid <kid>]\n`
+    + `${pad}[--intended-operation X] [--intended-target Y] [--intended-audience Z]\n`
+    + `${pad}[--intended-executor E] [--intended-adapter A] [--intended-environment ENV]\n`
+    + `${pad}[--intended-after-file PATH | --intended-scope-hash sha256:…]\n`
+    + `${pad}[--receipt <token>] [--as-of <ISO>] [--json]\n`
+    + '  no --key / --keys / --fetch: the pinned CodeRifts snapshot (keys/coderifts-keys.json), offline.\n'
+    + '  --as-of <ISO>  audit: was the grant inside its window at that instant? valid stays false;\n'
+    + '                 exit 0 when valid_at_as_of. Later than now + 30s, or unparsable: exit 2.\n';
+};
+const USAGE = usageFor('node verify-grant.js');
 
 function fail(msg) {
   process.stderr.write(`${msg}\n${USAGE}`);
   process.exit(2);
 }
 
-async function main() {
+/** 1.1.7: sha256 of the verifying key's SPKI DER (the same digest cli.js verified_with.key_sha256 carries). */
+function keySha256(publicKey) {
+  return crypto.createHash('sha256').update(publicKey.export({ type: 'spki', format: 'der' })).digest('hex');
+}
+
+/** 1.1.7: the pinned snapshot's file digest, first 12 hex — the name the keyring line and verified_with carry. */
+function snapshotSha12(file = VENDORED_KEYS_PATH) {
+  return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex').slice(0, 12);
+}
+
+/**
+ * The keyring line. The snapshot file carries no date of its own (measured 2026-10-31: its only key is
+ * `keys`), so the text line says so rather than inventing one.
+ */
+const keyringLine = (sha12) => `pinned CodeRifts snapshot ${sha12} — an owner-signed grant needs --key or --keys`;
+const SNAPSHOT_DATE_NOTE = '(the snapshot file carries no date)';
+
+/**
+ * The grant command. `node verify-grant.js …` and `coderifts-receipt-verifier grant …` both land here.
+ *
+ * 1.1.7 KEY DEFAULT: with no --key / --keys / --fetch the keys come from the pinned snapshot, offline —
+ * before, this fetched app.coderifts.com. That snapshot holds CodeRifts' keys only, so a grant an owner
+ * signed with their own key is UNKNOWN_KEY against it, and every output in that mode says so (the
+ * `keyring` field, and a stderr line unless --json).
+ */
+async function main(argv = process.argv.slice(2), { prog = 'node verify-grant.js' } = {}) {
+  const usage = usageFor(prog);
+  const die = (msg) => { process.stderr.write(`${msg}\n${usage}`); process.exit(2); };
   let opts;
   try {
-    opts = parseArgs(process.argv.slice(2));
+    opts = parseArgs(argv);
   } catch (e) {
-    return fail(e.message);
+    return die(e.message);
   }
+  // 1.1.8: --help / -h is a request, not a usage error: exit 0 (was exit 2).
   if (opts.help) {
-    process.stdout.write(USAGE);
-    process.exit(2);
+    process.stdout.write(usage);
+    process.exit(0);
   }
   if (!opts.grant || !String(opts.grant).trim()) {
-    return fail('no grant provided');
+    return die('no grant provided');
   }
 
   let ctx;
+  let keyringSource;
+  let snapshot = null;
   try {
     if (opts.keysSource) {
       const keyring = await loadKeyring(opts.keysSource);
       ctx = { keyring, expectedKid: opts.kid };
+      keyringSource = /^https?:\/\//i.test(opts.keysSource) ? 'url' : 'file';
     } else if (opts.keyFile) {
       const pem = fs.readFileSync(opts.keyFile, 'utf8');
       ctx = { publicKey: keyFromPem(pem), expectedKid: opts.kid };
+      keyringSource = 'file';
+    } else if (opts.fetch) {
+      // MEASURED 2026-10-31: this imported fetchKeyInfo from verify.js, which stopped exporting it when
+      // the command moved to cli.js — so at 1.1.6 every fetch here (the old default included) was exit 2
+      // "fetchKeyInfo is not a function" and never reached the network. The command's copy is used now.
+      const info = await require('./cli.js').fetchKeyInfo(opts.fetchUrl || DEFAULT_FETCH_URL, []);
+      ctx = info.keyring ? { keyring: info.keyring, expectedKid: opts.kid } : { publicKey: info.publicKey, expectedKid: opts.kid || info.kid };
+      keyringSource = 'url';
     } else {
-      const info = await fetchKeyInfo(opts.fetchUrl || DEFAULT_FETCH_URL);
-      ctx = { publicKey: info.publicKey, expectedKid: opts.kid || info.kid };
+      const keyring = await loadKeyring(VENDORED_KEYS_PATH);
+      ctx = { keyring, expectedKid: opts.kid };
+      keyringSource = 'pinned-snapshot';
+      snapshot = snapshotSha12();
     }
   } catch (e) {
-    return fail(`could not load public key: ${e.message}`);
+    return die(`could not load public key: ${e.message}`);
   }
 
   const intended = {};
@@ -555,19 +751,50 @@ async function main() {
   if (opts.intendedAudience != null) intended.audience = opts.intendedAudience;
   if (opts.intendedExecutor != null) intended.executor_id = opts.intendedExecutor;
   if (opts.intendedAdapter != null) intended.adapter_id = opts.intendedAdapter;
+  if (opts.intendedEnvironment != null) intended.environment = opts.intendedEnvironment;
   if (opts.intendedScopeHash != null) intended.scope_hash = opts.intendedScopeHash;
   if (opts.receipt != null) intended.receipt_token = opts.receipt;
   if (opts.intendedAfterFile) {
     try {
       intended.after_payload = fs.readFileSync(opts.intendedAfterFile, 'utf8');
     } catch (e) {
-      return fail(`could not read --intended-after-file: ${e.message}`);
+      return die(`could not read --intended-after-file: ${e.message}`);
     }
   }
 
-  const result = verifyExecutionGrantInner(opts.grant, ctx, { intended });
+  let result;
+  try {
+    result = verifyExecutionGrantInner(opts.grant, ctx, { intended, ...(opts.asOf !== undefined ? { asOf: opts.asOf } : {}) });
+  } catch (e) {
+    return die(e.message);
+  }
+  const passed = result.valid === true || result.valid_at_as_of === true;
+  if (passed && result.payload) {
+    const entry = ctx.keyring ? ctx.keyring.get(result.payload.kid) : null;
+    const pub = entry ? entry.publicKey : ctx.publicKey;
+    result = {
+      ...result,
+      verified_with: {
+        kid: result.payload.kid,
+        key_sha256: keySha256(pub),
+        keyring_source: keyringSource,
+        ...(snapshot ? { keyring_snapshot_sha256: snapshot } : {}),
+      },
+    };
+  }
+  if (snapshot) result = { ...result, keyring: keyringLine(snapshot) };
   process.stdout.write(JSON.stringify(result) + '\n');
-  process.exit(result.valid ? 0 : 1);
+  if (!opts.json) {
+    if (result.mode === 'audit') process.stderr.write(`${grantAuditLine(result)}\n`);
+    if (snapshot) process.stderr.write(`keyring: ${keyringLine(snapshot)} ${SNAPSHOT_DATE_NOTE}\n`);
+  }
+  process.exit((result.mode === 'audit' ? result.valid_at_as_of : result.valid) ? 0 : 1);
+}
+
+/** "GRANT_CURRENT_AT_AS_OF 2026-10-31T19:00:00Z · window … to … · expired now" (stderr, text mode). */
+function grantAuditLine(r) {
+  const w = r.window || {};
+  return `${r.status} ${r.as_of} · window ${w.not_before} to ${w.expires_at} · ${r.expired_now ? 'expired now' : 'not expired now'}`;
 }
 
 function verifyExecutionGrant(token, second, third) {
@@ -592,6 +819,13 @@ module.exports = {
   V1_OPTIONAL_SIGNED_FIELDS,
   V2_REQUIRED_STRINGS,
   V2_RESERVED_INERT,
+  V2_OPTIONAL_SIGNED_STRINGS,
+  VENDORED_KEYS_PATH,
+  GRANT_AS_OF_DOES_NOT_PROVE,
+  keyringLine,
+  snapshotSha12,
+  main,
+  USAGE,
   CLOCK_SKEW_LEEWAY_MS,
   isIssuedInFuture,
 };
