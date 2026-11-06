@@ -1,5 +1,9 @@
 # CodeRifts Kubernetes admission webhook
 
+## Status
+
+Frozen at receipt-verifier **v1.2.1** (signed tag, peeled `e1a346b`), 2026-11-06. No further re-vendoring; security fixes only. The reference verifier is [`@coderifts/receipt-verifier`](https://github.com/coderifts/receipt-verifier).
+
 Validating admission webhook for Kubernetes. It **denies** Pod and Deployment CREATE/UPDATE unless a signed CodeRifts chain-receipt verifies **offline** against a **customer-pinned** keyring and the receipt’s scope matches the admitted object (`operation=deploy`, `target_id=k8s:{kind}:{namespace}/{name}`).
 
 This is the same verify path as the GitHub Contract Gate: unwrap a DSSE envelope if present, then `verifyReceipt` on the compact token. Presence of a receipt or of a DSSE envelope is not a pass.
