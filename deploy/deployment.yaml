@@ -19,7 +19,7 @@ spec:
     spec:
       containers:
         - name: webhook
-          image: coderifts-k8s-admission:0.1.0
+          image: coderifts-k8s-admission:0.1.1
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8443

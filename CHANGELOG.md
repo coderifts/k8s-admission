@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.1 - 2026-11-06
 
 **Status: frozen** at receipt-verifier v1.2.1 (signed tag, peeled `e1a346b`), 2026-11-06. No further re-vendoring; security fixes only. The reference verifier is `@coderifts/receipt-verifier`.
 
